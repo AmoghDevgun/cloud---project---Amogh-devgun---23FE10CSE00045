@@ -1,0 +1,14 @@
+services:
+  app:
+    build: .
+    image: student-management-system:latest
+    ports:
+      - "5000:5000"
+    environment:
+      DATABASE: /data/students.db
+    volumes:
+      - student-data:/data
+    restart: unless-stopped
+
+volumes:
+  student-data:

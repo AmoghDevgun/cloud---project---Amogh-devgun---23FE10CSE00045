@@ -1,0 +1,124 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint with flake8
+        run: flake8 .
+
+      - name: Run tests with coverage
+        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=80
+
+  build:
+    name: Build & Push Docker Image
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=raw,value=latest
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the published image
+        run: |
+          docker pull ${{ env.IMAGE_NAME }}:latest
+          docker run -d --name sms-smoke -p 5000:5000 ${{ env.IMAGE_NAME }}:latest
+          for i in $(seq 1 10); do
+            if curl -sf http://localhost:5000/health; then
+              echo "Health check passed"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Health check failed"
+          docker logs sms-smoke
+          exit 1
+
+      - name: Clean up smoke container
+        if: always()
+        run: docker rm -f sms-smoke || true
+
+  deploy:
+    name: Deploy to Server
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+    steps:
+      - name: Deployment not configured
+        if: env.DEPLOY_HOST == ''
+        run: echo "Deploy secrets are not set - skipping deployment step."
+
+      - name: Deploy over SSH
+        if: env.DEPLOY_HOST != ''
+        run: |
+          echo "$DEPLOY_SSH_KEY" > deploy_key
+          chmod 600 deploy_key
+          ssh -o StrictHostKeyChecking=no -i deploy_key "$DEPLOY_USER@$DEPLOY_HOST" "
+            echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin &&
+            docker pull ${{ env.IMAGE_NAME }}:latest &&
+            docker stop sms || true &&
+            docker rm sms || true &&
+            docker run -d --name sms --restart unless-stopped -p 5000:5000 \
+              -v student-data:/data -e DATABASE=/data/students.db \
+              ${{ env.IMAGE_NAME }}:latest
+          "
+          rm -f deploy_key
